@@ -9,7 +9,7 @@ on:
         description: "Total frames"
         default: "2421"
       run_id:
-        description: "Run ID dari render sebelumnya (kosongkan = otomatis ambil run render terakhir)"
+        description: "Run ID dari render sebelumnya (kosongkan = otomatis cari run yang punya chunk)"
         default: ""
       zip:
         description: "Project zip file name (kosongkan jika sudah terekstrak)"
@@ -38,36 +38,34 @@ jobs:
           B=$(find _unzipped -name build.mjs -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' | head -n1)
           cp -a "$(dirname "$B")"/. .
           rm -rf _unzipped
-      - name: Find latest render run ID
-        id: find_run
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: Download chunks from previous render
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_RUN_ID: ${{ inputs.run_id }}
         run: |
           set -e
-          if [ -n "$INPUT_RUN_ID" ]; then
-            RUN_ID="$INPUT_RUN_ID"
-          else
-            RUN_ID=$(gh run list --workflow=main.yml --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
-            if [ -z "$RUN_ID" ]; then
-              RUN_ID=$(gh run list --workflow=render.yml --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
-            fi
+          RUN_ID="$INPUT_RUN_ID"
+          if [ -z "$RUN_ID" ]; then
+            for id in $(gh run list --limit 10 --json databaseId --jq '.[].databaseId'); do
+              HAS=$(gh api "repos/${{ github.repository }}/actions/runs/$id/artifacts" --jq '[.artifacts[] | select(.name == "chunk-0" and .expired == false)] | length')
+              if [ "$HAS" -gt 0 ]; then
+                RUN_ID="$id"
+                break
+              fi
+            done
           fi
           if [ -z "$RUN_ID" ]; then
-            echo "Run ID tidak ditemukan. Isi manual di kolom run_id."
+            echo "Tidak ada run sebelumnya yang masih menyimpan artifact chunk-0 (mungkin sudah kedaluwarsa > 24 jam)."
             exit 1
           fi
-          echo "Mengambil chunk dari Run ID: $RUN_ID"
-          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: chunk-*
-          path: chunks
-          merge-multiple: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ steps.find_run.outputs.run_id }}
+          echo "Mengunduh chunks dari Run ID: $RUN_ID"
+          mkdir -p _chunks_dl chunks
+          gh run download "$RUN_ID" -p "chunk-*" -D _chunks_dl
+          find _chunks_dl -type f -name "*.mp4" -exec mv {} chunks/ \;
+          rm -rf _chunks_dl
+          ls -la chunks/
       - name: Stitch final video
         shell: bash
         env:
@@ -97,4 +95,3 @@ jobs:
           name: final-video
           path: out/*
           retention-days: 7
-
