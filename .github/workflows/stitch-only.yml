@@ -1,0 +1,100 @@
+name: stitch-only
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: "Output file title"
+        default: "Meteran"
+      total:
+        description: "Total frames"
+        default: "2421"
+      run_id:
+        description: "Run ID dari render sebelumnya (kosongkan = otomatis ambil run render terakhir)"
+        default: ""
+      zip:
+        description: "Project zip file name (kosongkan jika sudah terekstrak)"
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  stitch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract project zip (when the repository holds only the .zip)
+        shell: bash
+        env:
+          ZIP_INPUT: ${{ inputs.zip }}
+        run: |
+          set -e
+          if [ -f build.mjs ] && [ -d src ]; then echo "project already extracted, nothing to do"; exit 0; fi
+          Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1)
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then echo "No project .zip found."; exit 1; fi
+          rm -rf _unzipped && mkdir _unzipped
+          unzip -q "$Z" -d _unzipped || python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$Z" _unzipped
+          B=$(find _unzipped -name build.mjs -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' | head -n1)
+          cp -a "$(dirname "$B")"/. .
+          rm -rf _unzipped
+      - name: Find latest render run ID
+        id: find_run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -e
+          if [ -n "$INPUT_RUN_ID" ]; then
+            RUN_ID="$INPUT_RUN_ID"
+          else
+            RUN_ID=$(gh run list --workflow=main.yml --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+            if [ -z "$RUN_ID" ]; then
+              RUN_ID=$(gh run list --workflow=render.yml --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+            fi
+          fi
+          if [ -z "$RUN_ID" ]; then
+            echo "Run ID tidak ditemukan. Isi manual di kolom run_id."
+            exit 1
+          fi
+          echo "Mengambil chunk dari Run ID: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          path: chunks
+          merge-multiple: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.find_run.outputs.run_id }}
+      - name: Stitch final video
+        shell: bash
+        env:
+          RAW_TITLE: ${{ inputs.title }}
+          RAW_TOTAL: ${{ inputs.total }}
+        run: |
+          set -e
+          TITLE="$(printf '%s' "$RAW_TITLE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          [ -n "$TITLE" ] || TITLE="short"
+          TOTAL="$(printf '%s' "$RAW_TOTAL" | tr -dc '0-9')"
+          python3 -c '
+          import re
+          p = "ci/stitch.sh"
+          s = open(p).read()
+          s = s.replace("csv=p=0", "default=noprint_wrappers=1:nokey=1")
+          s = re.sub(
+              r"^(\s*(?:local\s+)?)([A-Za-z_][A-Za-z0-9_]*)=.*ffprobe.*$",
+              lambda m: m.group(0) + "\n" + m.group(1) + m.group(2) + "=$(printf %s \"$" + m.group(2) + "\" | tr -dc 0-9)",
+              s,
+              flags=re.M,
+          )
+          open(p, "w").write(s)
+          '
+          bash ci/stitch.sh "$TITLE" "$TOTAL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: out/*
+          retention-days: 7
+
