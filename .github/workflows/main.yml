@@ -3,14 +3,25 @@
 # and the mix. Run it from the Actions tab ("Run workflow"). Needs mix_final.wav (make the audio first).
 # The repository may hold either the extracted project files or just the project .zip: every job extracts the zip itself.
 # NOTE: GitHub only reads this file from .github/workflows/render.yml in the repository, so upload it there (not inside the zip).
+
 name: render
+
 on:
   workflow_dispatch:
     inputs:
-      title: { description: "Output file title", default: "short" }
-      chunk: { description: "Frames per job (more jobs = faster, 20 run at once on a Free account)", default: "100" }
-      total: { description: "Frames to render (empty = the whole story; use e.g. 60 for a quick trial run)", default: "" }
-      zip: { description: "Project zip file name in the repository root (empty = the first .zip found; ignored if the files are already extracted)", default: "" }
+      title:
+        description: "Output file title"
+        default: "short"
+      chunk:
+        description: "Frames per job (more jobs = faster, 20 run at once on a Free account)"
+        default: "100"
+      total:
+        description: "Frames to render (empty = the whole story; use e.g. 60 for a quick trial run)"
+        default: ""
+      zip:
+        description: "Project zip file name in the repository root (empty = the first .zip found; ignored if the files are already extracted)"
+        default: ""
+
 jobs:
   plan:
     runs-on: ubuntu-latest
@@ -19,6 +30,7 @@ jobs:
       total: ${{ steps.p.outputs.total }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Extract project zip (when the repository holds only the .zip)
         shell: bash
         env:
@@ -36,10 +48,14 @@ jobs:
           cp -a "$(dirname "$B")"/. .
           rm -rf _unzipped
           ls
+
       - uses: actions/setup-node@v4
-        with: { node-version: 22 }
+        with:
+          node-version: 22
+
       - id: p
         run: node ci/plan.mjs "${{ inputs.chunk }}" "${{ inputs.total }}"
+
   render:
     needs: plan
     runs-on: ubuntu-latest
@@ -50,6 +66,7 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Extract project zip (when the repository holds only the .zip)
         shell: bash
         env:
@@ -67,27 +84,34 @@ jobs:
           cp -a "$(dirname "$B")"/. .
           rm -rf _unzipped
           ls
+
       - uses: actions/setup-node@v4
-        with: { node-version: 22 }
+        with:
+          node-version: 22
+
       - name: Tools
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           npm install --no-save playwright
           npx playwright install --with-deps chromium
+
       - run: node build.mjs .
       - run: node render.mjs frames "${{ matrix.a }}-${{ matrix.b }}"
       - run: bash ci/encode_chunk.sh ${{ matrix.a }} ${{ matrix.b }} ${{ matrix.i }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: chunk-${{ matrix.i }}
           path: chunks/*.mp4
           retention-days: 1
           if-no-files-found: error
+
   stitch:
     needs: [plan, render]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Extract project zip (when the repository holds only the .zip)
         shell: bash
         env:
@@ -105,13 +129,39 @@ jobs:
           cp -a "$(dirname "$B")"/. .
           rm -rf _unzipped
           ls
+
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
       - uses: actions/download-artifact@v4
         with:
           pattern: chunk-*
           path: chunks
           merge-multiple: true
-      - run: bash ci/stitch.sh "${{ inputs.title }}" "${{ needs.plan.outputs.total }}"
+
+      - name: Stitch chunks and audio
+        shell: bash
+        env:
+          RAW_TITLE: ${{ inputs.title }}
+          TOTAL_FRAMES: ${{ needs.plan.outputs.total }}
+        run: |
+          set -e
+          python3 -c '
+          import re
+          p = "ci/stitch.sh"
+          with open(p, "r") as f:
+              s = f.read()
+          s = s.replace("csv=p=0", "default=noprint_wrappers=1:nokey=1")
+          s = re.sub(
+              r'\''((?:echo|printf)\s+["\x27]frames in output:[^\n]*?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?)'\'',
+              r'\''\2=$(echo "$\2" | tr -cd "0-9"); \1'\'',
+              s,
+          )
+          with open(p, "w") as f:
+              f.write(s)
+          '
+          CLEAN_TITLE=$(echo "$RAW_TITLE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          bash ci/stitch.sh "$CLEAN_TITLE" "$TOTAL_FRAMES"
+
       - uses: actions/upload-artifact@v4
         with:
           name: final-video
